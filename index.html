@@ -1,1 +1,289 @@
-g
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getFirestore, 
+  doc, 
+  setDoc, 
+  onSnapshot, 
+  updateDoc, 
+  collection, 
+  query, 
+  where,
+  deleteDoc,
+  serverTimestamp 
+} from 'firebase/firestore';
+import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { LucideTv, LucideUsers, LucideSend, LucideZap, LucideCrown, LucideLogOut } from 'lucide-react';
+
+// --- Firebase Configuration ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'textsavvy-multiplayer';
+
+const API_KEY = ""; // Managed by environment
+const MODEL = "gemini-2.5-flash-preview-09-2025";
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState('lobby'); // lobby, host, player
+  const [broadcastId, setBroadcastId] = useState('');
+  const [gameState, setGameState] = useState(null);
+  const [input, setInput] = useState('');
+  const [isWinner, setIsWinner] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [chat, setChat] = useState([]);
+
+  // 1. Auth & Setup
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        await signInAnonymously(auth);
+      } catch (err) {
+        console.error("Auth failed", err);
+      }
+    };
+    initAuth();
+    const unsub = onAuthStateChanged(auth, setUser);
+    return () => unsub();
+  }, []);
+
+  // 2. Real-time Game Sync
+  useEffect(() => {
+    if (!broadcastId || !user) return;
+
+    const gameDoc = doc(db, 'artifacts', appId, 'public', 'data', 'broadcasts', broadcastId);
+    const unsub = onSnapshot(gameDoc, (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        setGameState(data);
+        // Reset winner status if a new word is pushed
+        if (data.currentWord?.answer) {
+          setIsWinner(false);
+        }
+      } else if (view === 'player') {
+        alert("Broadcast ended by host.");
+        setView('lobby');
+      }
+    }, (err) => console.error("Sync error:", err));
+
+    return () => unsub();
+  }, [broadcastId, user, view]);
+
+  // --- Host Actions ---
+  const createBroadcast = async () => {
+    if (!user) return;
+    setLoading(true);
+    const id = user.uid.substring(0, 6).toUpperCase();
+    const ref = doc(db, 'artifacts', appId, 'public', 'data', 'broadcasts', id);
+    
+    const initialData = {
+      hostId: user.uid,
+      hostName: `Host_${id}`,
+      status: 'waiting',
+      currentWord: null,
+      playersCount: 0,
+      lastUpdated: serverTimestamp()
+    };
+
+    await setDoc(ref, initialData);
+    setBroadcastId(id);
+    setView('host');
+    setLoading(false);
+  };
+
+  const generateNewWord = async () => {
+    setLoading(true);
+    try {
+      const prompt = "Generate a single 5-7 letter word for a game show. Return JSON: { \"scrambled\": \"S C R A M B L E D\", \"answer\": \"ANSWER\" }";
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: "application/json" }
+        })
+      });
+      const data = await response.json();
+      const wordObj = JSON.parse(data.candidates[0].content.parts[0].text);
+      
+      const ref = doc(db, 'artifacts', appId, 'public', 'data', 'broadcasts', broadcastId);
+      await updateDoc(ref, {
+        currentWord: wordObj,
+        status: 'live',
+        winners: [],
+        lastUpdated: serverTimestamp()
+      });
+    } catch (err) {
+      console.error("Gemini error", err);
+    }
+    setLoading(false);
+  };
+
+  const closeBroadcast = async () => {
+    const ref = doc(db, 'artifacts', appId, 'public', 'data', 'broadcasts', broadcastId);
+    await deleteDoc(ref);
+    setView('lobby');
+    setBroadcastId('');
+  };
+
+  // --- Player Actions ---
+  const joinBroadcast = async (id) => {
+    setBroadcastId(id.toUpperCase());
+    setView('player');
+  };
+
+  const checkAnswer = async (val) => {
+    setInput(val.toUpperCase());
+    if (val.toUpperCase() === gameState?.currentWord?.answer) {
+      setIsWinner(true);
+      const ref = doc(db, 'artifacts', appId, 'public', 'data', 'broadcasts', broadcastId);
+      const newWinner = { uid: user.uid, time: Date.now() };
+      await updateDoc(ref, {
+        winners: [...(gameState.winners || []), newWinner]
+      });
+    }
+  };
+
+  // --- UI Components ---
+  if (view === 'lobby') {
+    return (
+      <div className="min-h-screen bg-[#050c1b] flex items-center justify-center p-4 text-white font-sans">
+        <div className="w-full max-w-md space-y-8 text-center">
+          <div className="space-y-2">
+            <h1 className="text-6xl font-black text-[#fbbf24] tracking-tighter italic">TextSavvy</h1>
+            <p className="text-blue-400 font-bold tracking-widest text-sm uppercase">Multiplayer Live Arena</p>
+          </div>
+
+          <div className="bg-[#111b2d] p-8 rounded-[40px] border border-white/10 shadow-2xl space-y-6">
+            <button 
+              onClick={createBroadcast}
+              disabled={loading}
+              className="w-full py-5 bg-gradient-to-r from-blue-600 to-blue-400 rounded-2xl font-black text-xl flex items-center justify-center gap-3 shadow-lg hover:scale-[1.02] transition-transform"
+            >
+              <LucideCrown size={28} /> {loading ? 'INITIATING...' : 'BECOME THE HOST'}
+            </button>
+
+            <div className="relative flex items-center py-4">
+              <div className="flex-grow border-t border-white/10"></div>
+              <span className="flex-shrink mx-4 text-white/30 text-xs font-bold">OR JOIN A SHOW</span>
+              <div className="flex-grow border-t border-white/10"></div>
+            </div>
+
+            <div className="space-y-3">
+              <input 
+                type="text" 
+                placeholder="ENTER 6-DIGIT CODE" 
+                className="w-full bg-black/40 border border-white/10 p-5 rounded-2xl text-center text-2xl font-black placeholder:text-white/10 outline-none focus:border-blue-500"
+                onChange={(e) => setBroadcastId(e.target.value)}
+              />
+              <button 
+                onClick={() => joinBroadcast(broadcastId)}
+                className="w-full py-4 bg-white/5 border border-white/10 rounded-2xl font-bold hover:bg-white/10 transition-colors"
+              >
+                JOIN BROADCAST
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-[#050c1b] flex items-center justify-center p-4 text-white font-sans overflow-hidden">
+      <div className="w-full max-w-md h-[800px] bg-[#0a1428] rounded-[60px] border-[12px] border-[#1f2937] relative flex flex-col shadow-2xl">
+        
+        {/* Header */}
+        <div className="p-8 flex justify-between items-center z-10">
+          <div className="bg-red-600 px-3 py-1 rounded-md text-[10px] font-black flex items-center gap-2 shadow-[0_0_15px_rgba(220,38,38,0.5)]">
+            <div className="w-2 h-2 bg-white rounded-full animate-pulse" /> LIVE
+          </div>
+          <div className="bg-black/40 px-3 py-1 rounded-full text-[10px] font-bold border border-white/10 flex items-center gap-2">
+            <LucideUsers size={12} /> {gameState?.winners?.length || 0} SOLVED
+          </div>
+          <button onClick={view === 'host' ? closeBroadcast : () => setView('lobby')} className="text-white/40 hover:text-white">
+            <LucideLogOut size={20} />
+          </button>
+        </div>
+
+        {/* Host/Video Section */}
+        <div className="flex-grow relative flex flex-col items-center justify-center -mt-10">
+            <div className="w-32 h-32 bg-blue-600 rounded-full border-4 border-blue-400 flex items-center justify-center overflow-hidden shadow-2xl mb-4">
+                <LucideCrown size={60} className="text-white/20 absolute" />
+                <span className="text-4xl font-black z-10">{gameState?.hostName?.[0]}</span>
+            </div>
+            <h2 className="text-xl font-black italic">{gameState?.hostName}</h2>
+            <p className="text-xs text-blue-400 font-bold uppercase tracking-widest mt-1">
+                {view === 'host' ? 'Directing the Show' : 'Live from New York'}
+            </p>
+            
+            {view === 'host' && (
+              <div className="mt-8 space-y-3">
+                 <button 
+                  onClick={generateNewWord} 
+                  disabled={loading}
+                  className="bg-[#fbbf24] text-black px-8 py-3 rounded-full font-black text-sm flex items-center gap-2 hover:scale-105 transition-transform"
+                >
+                  <LucideZap size={18} fill="black" /> {loading ? 'GENERATING...' : 'NEXT AI PUZZLE'}
+                </button>
+                <p className="text-[10px] text-white/40 text-center uppercase font-bold">Code: {broadcastId}</p>
+              </div>
+            )}
+        </div>
+
+        {/* Puzzle/Interaction Section */}
+        <div className="bg-white rounded-t-[40px] p-8 h-[55%] flex flex-col items-center shadow-[0_-10px_40px_rgba(0,0,0,0.3)]">
+          {gameState?.currentWord ? (
+            <>
+              <div className="w-full flex justify-between items-center mb-6">
+                 <div className="h-2 flex-1 bg-gray-100 rounded-full overflow-hidden mr-4">
+                    <div className="h-full bg-blue-600 transition-all duration-1000" style={{ width: '45%' }}></div>
+                 </div>
+                 <div className="bg-slate-900 text-yellow-400 px-3 py-1 rounded-xl font-black text-sm">15</div>
+              </div>
+
+              <div className="flex gap-2 mb-8">
+                {gameState.currentWord.scrambled.split(' ').map((char, i) => (
+                  <div key={i} className="w-12 h-14 bg-slate-100 border-b-4 border-slate-300 rounded-xl flex items-center justify-center text-2xl font-black text-slate-800">
+                    {char}
+                  </div>
+                ))}
+              </div>
+
+              {isWinner ? (
+                <div className="text-center space-y-4 animate-bounce">
+                  <h3 className="text-3xl font-black text-green-600">SAVVY!</h3>
+                  <p className="text-slate-500 font-bold">You cracked the code!</p>
+                </div>
+              ) : (
+                <div className="w-full space-y-4">
+                  <input 
+                    type="text" 
+                    value={input}
+                    disabled={view === 'host'}
+                    onChange={(e) => checkAnswer(e.target.value)}
+                    placeholder={view === 'host' ? "HOSTING MODE" : "TYPE ANSWER"}
+                    className="w-full p-4 bg-slate-100 border-2 border-slate-200 rounded-2xl text-center text-xl font-bold text-slate-900 focus:border-blue-500 outline-none"
+                  />
+                  <p className="text-center text-[10px] text-slate-400 font-bold uppercase tracking-widest">
+                    {view === 'host' ? 'Wait for players to solve' : 'Unscramble to win cash'}
+                  </p>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="flex flex-col items-center justify-center h-full text-slate-400 space-y-4">
+                <LucideTv size={48} className="opacity-20" />
+                <p className="font-bold text-center">
+                    {view === 'host' ? 'Ready to go live, Scott?' : 'Waiting for Scott to push the next puzzle...'}
+                </p>
+            </div>
+          )}
+        </div>
+
+      </div>
+    </div>
+  );
+}
